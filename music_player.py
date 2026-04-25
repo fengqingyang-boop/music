@@ -1,11 +1,12 @@
 import sys
 import os
+import subprocess
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QListWidget, QListWidgetItem,
-    QFileDialog, QMessageBox, QFrame, QSplitter, QComboBox
+    QFileDialog, QMessageBox, QComboBox
 )
-from PyQt5.QtCore import Qt, QUrl
+from PyQt5.QtCore import Qt, QUrl, QTimer
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent, QMediaPlaylist
 from PyQt5.QtGui import QFont
 from mutagen import File as MutagenFile
@@ -22,26 +23,35 @@ class MusicPlayer(QMainWindow):
         self.current_index = -1
         self.is_playing = False
         self.is_paused = False
+        self.is_stopped = True
 
         self.available_speeds = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+        self.current_speed = 1.0
 
-        self.init_media_player()
+        self.using_external_player = False
+        self.external_process = None
+
         self.init_ui()
+        self.init_media_player()
 
     def init_media_player(self):
-        self.media_player = QMediaPlayer()
-        self.media_playlist = QMediaPlaylist()
-        self.media_player.setPlaylist(self.media_playlist)
+        try:
+            self.media_player = QMediaPlayer()
+            self.media_playlist = QMediaPlaylist()
+            self.media_player.setPlaylist(self.media_playlist)
 
-        self.media_player.setVolume(50)
+            self.media_player.setVolume(50)
 
-        self.media_player.positionChanged.connect(self.update_position)
-        self.media_player.durationChanged.connect(self.update_duration)
-        self.media_player.stateChanged.connect(self.on_state_changed)
-        self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
-        self.media_playlist.currentIndexChanged.connect(self.on_current_index_changed)
+            self.media_player.positionChanged.connect(self.update_position)
+            self.media_player.durationChanged.connect(self.update_duration)
+            self.media_player.stateChanged.connect(self.on_state_changed)
+            self.media_player.mediaStatusChanged.connect(self.on_media_status_changed)
 
-        self.slider_being_dragged = False
+            self.slider_being_dragged = False
+            self.qmediaplayer_available = True
+        except Exception as e:
+            self.qmediaplayer_available = False
+            self.status_label.setText(f"QMediaPlayer 不可用，将使用系统默认播放器")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -450,8 +460,7 @@ class MusicPlayer(QMainWindow):
             for file in files:
                 if file not in self.playlist_files:
                     self.playlist_files.append(file)
-                    self.media_playlist.addMedia(QMediaContent(QUrl.fromLocalFile(file)))
-
+                    
                     filename = os.path.basename(file)
                     item = QListWidgetItem(filename)
                     item.setData(Qt.UserRole, file)
@@ -481,7 +490,6 @@ class MusicPlayer(QMainWindow):
                         full_path = os.path.join(root, file)
                         if full_path not in self.playlist_files:
                             self.playlist_files.append(full_path)
-                            self.media_playlist.addMedia(QMediaContent(QUrl.fromLocalFile(full_path)))
 
                             filename = os.path.basename(full_path)
                             item = QListWidgetItem(filename)
@@ -510,7 +518,8 @@ class MusicPlayer(QMainWindow):
         if reply == QMessageBox.Yes:
             self.stop_playback()
             self.playlist_files.clear()
-            self.media_playlist.clear()
+            if self.qmediaplayer_available:
+                self.media_playlist.clear()
             self.playlist_widget.clear()
             self.current_index = -1
             self.song_title_label.setText("未选择歌曲")
@@ -524,6 +533,12 @@ class MusicPlayer(QMainWindow):
             return
 
         try:
+            if self.qmediaplayer_available:
+                self.media_playlist.clear()
+                media_content = QMediaContent(QUrl.fromLocalFile(file_path))
+                self.media_playlist.addMedia(media_content)
+                self.media_playlist.setCurrentIndex(0)
+            
             self.update_song_info(file_path)
 
             for i in range(self.playlist_widget.count()):
@@ -584,38 +599,86 @@ class MusicPlayer(QMainWindow):
 
         if self.current_index == -1:
             self.current_index = 0
-            self.media_playlist.setCurrentIndex(0)
             self.load_song(self.playlist_files[0])
 
-        if self.is_playing:
-            self.media_player.pause()
-            self.is_playing = False
-            self.is_paused = True
-            self.play_button.setText("▶ 继续")
-            self.status_label.setText("已暂停")
-        else:
-            if self.is_paused:
-                self.media_player.play()
-                self.is_playing = True
-                self.is_paused = False
-                self.play_button.setText("⏸ 暂停")
-                self.status_label.setText("正在播放")
+        if self.using_external_player:
+            if self.external_process and self.external_process.poll() is None:
+                self.stop_external_player()
+                self.play_button.setText("▶ 播放")
+                self.is_playing = False
             else:
-                self.start_playback()
+                self.start_external_playback()
+        else:
+            if self.is_playing:
+                if self.qmediaplayer_available:
+                    self.media_player.pause()
+                self.is_playing = False
+                self.is_paused = True
+                self.play_button.setText("▶ 继续")
+                self.status_label.setText("已暂停")
+            else:
+                if self.is_paused:
+                    if self.qmediaplayer_available:
+                        self.media_player.play()
+                    self.is_playing = True
+                    self.is_paused = False
+                    self.play_button.setText("⏸ 暂停")
+                    self.status_label.setText("正在播放")
+                else:
+                    self.start_playback()
 
     def start_playback(self):
         if self.current_index >= 0 and self.current_index < len(self.playlist_files):
-            self.media_playlist.setCurrentIndex(self.current_index)
             self.load_song(self.playlist_files[self.current_index])
-            self.media_player.play()
-            self.is_playing = True
-            self.is_paused = False
-            self.play_button.setText("⏸ 暂停")
-            self.status_label.setText(f"正在播放: {os.path.basename(self.playlist_files[self.current_index])}")
+            
+            if self.qmediaplayer_available:
+                self.media_player.setPlaybackRate(self.current_speed)
+                self.media_player.play()
+                self.is_playing = True
+                self.is_paused = False
+                self.is_stopped = False
+                self.play_button.setText("⏸ 暂停")
+                self.status_label.setText(f"正在播放: {os.path.basename(self.playlist_files[self.current_index])}")
+            else:
+                self.start_external_playback()
+
+    def start_external_playback(self):
+        if self.current_index >= 0 and self.current_index < len(self.playlist_files):
+            file_path = self.playlist_files[self.current_index]
+            
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(file_path)
+                
+                self.using_external_player = True
+                self.is_playing = True
+                self.play_button.setText("⏹ 关闭外部播放器")
+                self.status_label.setText(f"已使用系统默认播放器打开: {os.path.basename(file_path)}")
+                
+                QMessageBox.information(self, "提示", 
+                    f"已使用系统默认播放器打开音乐文件。\n\n"
+                    f"原因：QMediaPlayer 无法播放此格式的文件。\n\n"
+                    f"建议解决方案：\n"
+                    f"1. 安装 K-Lite Codec Pack 编解码器包\n"
+                    f"2. 或者使用 WAV 格式的音频文件")
+                    
+            except Exception as e:
+                QMessageBox.warning(self, "错误", 
+                    f"无法打开文件: {str(e)}\n\n"
+                    f"建议安装音频编解码器（如 K-Lite Codec Pack）\n"
+                    f"或者使用 WAV 格式的音频文件")
+
+    def stop_external_player(self):
+        self.using_external_player = False
+        self.is_playing = False
+        self.external_process = None
 
     def play_previous(self):
         if not self.playlist_files:
             return
+
+        if self.using_external_player:
+            self.stop_external_player()
 
         if self.current_index > 0:
             self.current_index -= 1
@@ -628,6 +691,9 @@ class MusicPlayer(QMainWindow):
         if not self.playlist_files:
             return
 
+        if self.using_external_player:
+            self.stop_external_player()
+
         if self.current_index < len(self.playlist_files) - 1:
             self.current_index += 1
         else:
@@ -636,9 +702,15 @@ class MusicPlayer(QMainWindow):
         self.start_playback()
 
     def stop_playback(self):
-        self.media_player.stop()
+        if self.using_external_player:
+            self.stop_external_player()
+        else:
+            if self.qmediaplayer_available:
+                self.media_player.stop()
+            
         self.is_playing = False
         self.is_paused = False
+        self.is_stopped = True
         self.play_button.setText("▶ 播放")
         self.progress_slider.setValue(0)
         self.current_time_label.setText("00:00")
@@ -651,12 +723,18 @@ class MusicPlayer(QMainWindow):
             self.start_playback()
 
     def change_volume(self, value):
-        self.media_player.setVolume(value)
+        if self.qmediaplayer_available:
+            self.media_player.setVolume(value)
         self.volume_label.setText(f"{value}%")
 
     def change_playback_speed(self, text):
         speed = float(text.replace('x', ''))
-        self.media_player.setPlaybackRate(speed)
+        self.current_speed = speed
+        
+        if self.qmediaplayer_available and self.is_playing:
+            position = self.media_player.position()
+            self.media_player.setPlaybackRate(speed)
+            self.media_player.setPosition(position)
 
     def increase_speed(self):
         current_text = self.speed_combo.currentText()
@@ -696,11 +774,12 @@ class MusicPlayer(QMainWindow):
         self.set_position_from_slider()
 
     def set_position_from_slider(self):
-        slider_value = self.progress_slider.value()
-        duration = self.media_player.duration()
-        if duration > 0:
-            position = (slider_value / 1000) * duration
-            self.media_player.setPosition(int(position))
+        if self.qmediaplayer_available:
+            slider_value = self.progress_slider.value()
+            duration = self.media_player.duration()
+            if duration > 0:
+                position = (slider_value / 1000) * duration
+                self.media_player.setPosition(int(position))
 
     def format_time(self, milliseconds):
         if milliseconds < 0:
@@ -716,24 +795,28 @@ class MusicPlayer(QMainWindow):
         if state == QMediaPlayer.PlayingState:
             self.is_playing = True
             self.is_paused = False
+            self.is_stopped = False
             self.play_button.setText("⏸ 暂停")
         elif state == QMediaPlayer.PausedState:
             self.is_playing = False
             self.is_paused = True
+            self.is_stopped = False
             self.play_button.setText("▶ 继续")
         elif state == QMediaPlayer.StoppedState:
             self.is_playing = False
             self.is_paused = False
+            self.is_stopped = True
             self.play_button.setText("▶ 播放")
 
     def on_media_status_changed(self, status):
         if status == QMediaPlayer.LoadedMedia:
-            self.status_label.setText("媒体已加载")
+            self.status_label.setText("媒体已加载，准备播放")
         elif status == QMediaPlayer.BufferedMedia:
             pass
         elif status == QMediaPlayer.EndOfMedia:
             self.is_playing = False
             self.is_paused = False
+            self.is_stopped = True
             self.play_button.setText("▶ 播放")
             self.status_label.setText("播放完成")
             self.progress_slider.setValue(0)
@@ -742,14 +825,25 @@ class MusicPlayer(QMainWindow):
             if self.current_index < len(self.playlist_files) - 1:
                 self.play_next()
         elif status == QMediaPlayer.InvalidMedia:
-            self.status_label.setText("无效的媒体文件")
+            self.status_label.setText("无法播放此媒体格式")
+            QMessageBox.warning(self, "播放错误", 
+                f"无法播放此文件。\n\n"
+                f"可能的原因：\n"
+                f"1. 文件格式不支持（MP3 需要额外编解码器）\n"
+                f"2. 文件损坏\n\n"
+                f"解决方案：\n"
+                f"1. 安装 K-Lite Codec Pack（推荐）\n"
+                f"   下载地址：https://codecguide.com/\n\n"
+                f"2. 或者使用 WAV 格式的音频文件\n\n"
+                f"现在将尝试使用系统默认播放器打开...")
+            
+            self.start_external_playback()
         elif status == QMediaPlayer.NoMedia:
             self.status_label.setText("没有媒体")
-
-    def on_current_index_changed(self, index):
-        if index >= 0 and index < len(self.playlist_files):
-            self.current_index = index
-            self.load_song(self.playlist_files[index])
+        elif status == QMediaPlayer.LoadingMedia:
+            self.status_label.setText("正在加载媒体...")
+        elif status == QMediaPlayer.StalledMedia:
+            self.status_label.setText("媒体加载停滞")
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Space:
